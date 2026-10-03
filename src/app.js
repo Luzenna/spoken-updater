@@ -1,0 +1,568 @@
+// @ts-check
+// The update engine: work out what each item needs, then download, extract and
+// swap only those items. Every side effect goes through `deps`, so tests can run
+// the whole flow against fake servers and fake AddOns trees.
+import fs from 'node:fs';
+import path from 'node:path';
+import readline from 'node:readline/promises';
+import * as semver from './semver.js';
+import * as log from './log.js';
+import { buildCatalog } from './catalog.js';
+import { loadConfig, saveConfig, loadState, saveState, stateKey } from './config.js';
+import { detect } from './detect/detect.js';
+import { findChild } from './detect/fold.js';
+import { tocFiles, readFolderToc, folderSupports, FOREVER_INTERFACE } from './toc.js';
+import { cachePath, download, remainingBytes } from './download.js';
+import { extractZip, findAddonRoots, isSpokenFolder, uncompressedSize } from './extract.js';
+import { swapIn, recover, workDirFor, pendingJournal, removeLeftovers } from './swap.js';
+import { acquireLock } from './lock.js';
+import { createProgress } from './progress.js';
+import { freeBytes, deviceOf, runningWow } from './platform.js';
+
+export class UsageError extends Error {}
+
+const MARGIN = 200e6; // keep 200 MB free on every filesystem we write to
+const UNPACK_FACTOR = 1.05; // audio barely compresses; exact size is checked again per zip
+
+/**
+ * @typedef {object} Deps
+ * @property {import('./sources/source.js').Source} source
+ * @property {string} configDir
+ * @property {string} cacheDir
+ * @property {typeof fetch} [fetchImpl]
+ * @property {import('./detect/detect.js').Env} [env]
+ * @property {() => string[]} [runningWow]
+ * @property {(question: string) => Promise<string>} [ask]
+ * @property {boolean} [tty]
+ *
+ * @typedef {object} Options
+ * @property {string} [addons]
+ * @property {boolean} [yes]
+ * @property {boolean} [force]
+ * @property {boolean} [dryRun]
+ * @property {string} [lang]
+ * @property {string[]} [only]
+ *
+ * @typedef {'current' | 'outdated' | 'not-installed' | 'missing' | 'broken' | 'unavailable' | 'error'} Status
+ * @typedef {object} Plan
+ * @property {import('./catalog.js').Item} item
+ * @property {import('./sources/source.js').Release | null} release
+ * @property {Status} status
+ * @property {string | null} installed
+ * @property {string} reason
+ * @property {string[]} folders  folders on disk that belong to the item
+ * @property {number} diskBytes
+ * @property {boolean} act       will be (re)installed
+ */
+
+/** File count and total size of a folder tree. @param {string} dir */
+export function treeStats(dir) {
+  let files = 0, bytes = 0;
+  const walk = (/** @type {string} */ d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile()) {
+        files++;
+        bytes += fs.statSync(p).size;
+      }
+    }
+  };
+  walk(dir);
+  return { files, bytes };
+}
+
+/**
+ * Folder names an item had before this tool ever installed it (e.g. installed by
+ * hand or by another manager), guessed from the asset name: "SpokenPlayer-2.3.2.zip"
+ * -> SpokenPlayer; the "SpokenQuestsAudioAll" bundle -> SpokenQuestsAudio<Faction>.
+ * @param {string} addons @param {import('./sources/source.js').Release} rel
+ */
+function adoptFolders(addons, rel) {
+  const base = rel.asset.name.replace(/-v?\d+\.\d+\.\d+.*\.zip$/i, '').replace(/\.zip$/i, '');
+  let names;
+  try {
+    names = fs.readdirSync(addons, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch {
+    return [];
+  }
+  const exact = names.filter((n) => n.toLowerCase() === base.toLowerCase());
+  if (exact.length) return exact;
+  if (/All$/.test(base)) {
+    const stem = base.slice(0, -3).toLowerCase();
+    return names.filter((n) => n.toLowerCase().startsWith(stem) && /^[A-Z]/.test(n.slice(stem.length)));
+  }
+  return [];
+}
+
+/**
+ * Compare what's on disk with the latest release. The .toc wins over the state
+ * file; the state file supplies folder names and the size baseline.
+ * @param {import('./catalog.js').Item} item
+ * @param {import('./sources/source.js').Release | null} rel
+ * @param {string} addons
+ * @param {import('./config.js').ItemState | undefined} st
+ * @returns {Plan}
+ */
+export function inspect(item, rel, addons, st) {
+  /** @type {Plan} */
+  const plan = { item, release: rel, status: 'current', installed: null, reason: '', folders: [], diskBytes: 0, act: false };
+  if (!rel) {
+    return { ...plan, status: 'unavailable', reason: item.optional ? 'not published for this language' : 'no release found' };
+  }
+  // Older state files may list non-Spoken placeholder folders; they're not ours to check.
+  const recorded = (st ? Object.keys(st.folders) : adoptFolders(addons, rel)).filter(isSpokenFolder);
+  if (!recorded.length) return { ...plan, status: 'not-installed', reason: 'not installed', act: true };
+
+  /** @type {{ name: string, version: string | null, recordedVersion: string | null }[]} */
+  const seen = [];
+  for (const name of recorded) {
+    const actual = findChild(addons, name, { dirsOnly: true });
+    if (!actual) return { ...plan, status: 'missing', reason: `folder ${name} is missing`, act: true };
+    const dir = path.join(addons, actual);
+    plan.folders.push(actual);
+    if (!tocFiles(dir).length) return { ...plan, status: 'broken', reason: `${name} has no .toc`, act: true };
+    const s = treeStats(dir);
+    plan.diskBytes += s.bytes;
+    const rec = st?.folders[name];
+    if (rec && (s.files < rec.files * 0.9 || s.files > rec.files * 1.1 || s.bytes < rec.bytes * 0.9 || s.bytes > rec.bytes * 1.1)) {
+      return { ...plan, status: 'broken', reason: `${name} looks incomplete (${s.files}/${rec.files} files)`, act: true };
+    }
+    seen.push({ name, version: readFolderToc(dir)?.version ?? null, recordedVersion: rec?.tocVersion ?? null });
+  }
+
+  // The item's version comes from its main folders: those whose .toc carried the
+  // release version at install time (this skips tombstones and helper folders that
+  // have their own numbering). Without such a record, every versioned folder counts.
+  let primary = st ? seen.filter((f) => f.recordedVersion === st.version) : [];
+  if (!primary.length) primary = seen.filter((f) => f.version);
+  const versions = primary.map((f) => f.version).filter((v) => v !== null);
+  const installed = versions.length ? versions.reduce((a, b) => (semver.compare(a, b) <= 0 ? a : b)) : st?.version ?? null;
+  plan.installed = installed;
+
+  if (installed && semver.compare(installed, rel.version) === 0) return plan;
+  // Never downgrade: a newer build (from Wago, or a dev copy) is left alone.
+  if (installed && semver.compare(installed, rel.version) > 0) return { ...plan, reason: `newer than the latest release (${rel.version})` };
+  // Upstream sometimes ships a .toc whose Version differs from the tag. If the
+  // folders still hold exactly what we installed from this tag, it is current.
+  if (st && st.tag === rel.tag && primary.length && primary.every((f) => f.version === f.recordedVersion)) {
+    return { ...plan, installed: st.version };
+  }
+  return { ...plan, status: 'outdated', reason: `${installed ?? 'unknown'} -> ${rel.version}`, act: true };
+}
+
+/** @param {Deps} deps */
+function makeAsk(deps) {
+  return deps.ask ?? (async (/** @type {string} */ q) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      return await rl.question(q);
+    } finally {
+      rl.close();
+    }
+  });
+}
+
+/**
+ * Pick the AddOns folder: --addons, then config, then detection (asking when
+ * several are found and we may ask).
+ * @param {Options} opts @param {Deps} deps @param {import('./config.js').Config} cfg
+ */
+export async function resolveAddons(opts, deps, cfg) {
+  if (opts.addons) return path.resolve(opts.addons);
+  if (cfg.addons_path) return path.resolve(cfg.addons_path);
+  const found = detect({ clientFolder: cfg.client_folder }, deps.env);
+  if (!found.length) {
+    throw new UsageError(
+      `no WoW Forever AddOns folder found (looked for World of Warcraft/${cfg.client_folder}).\n` +
+      '  Pass --addons "<path to Interface/AddOns>" or set addons_path in the config.');
+  }
+  const confirmed = found.filter((c) => c.forever);
+  if (confirmed.length === 1) return confirmed[0].addons;
+  if (found.length === 1) {
+    log.warn(`using ${found[0].addons} (could not confirm it is the 1.60.x Forever client)`);
+    return found[0].addons;
+  }
+  const list = found.map((c, i) => `  ${i + 1}) ${c.addons}\n     ${c.label}${c.version ? `, game ${c.version}` : ''}${c.forever ? ' [Forever]' : ''}`).join('\n');
+  if (opts.yes || !(deps.tty ?? process.stdin.isTTY)) {
+    throw new UsageError(`several AddOns folders found; choose one with --addons or addons_path in the config:\n${list}`);
+  }
+  log.info(`Several WoW installs were found:\n${list}`);
+  const ask = makeAsk(deps);
+  for (;;) {
+    const n = Number((await ask(`Install into which one? [1-${found.length}] `)).trim());
+    if (Number.isInteger(n) && n >= 1 && n <= found.length) {
+      const chosen = found[n - 1].addons;
+      saveConfig(deps.configDir, { ...cfg, addons_path: chosen });
+      log.info(`Saved choice to ${path.join(deps.configDir, 'config.json')}`);
+      return chosen;
+    }
+  }
+}
+
+/** @param {Options} opts @param {import('./config.js').Config} cfg */
+function catalogFor(opts, cfg) {
+  const items = buildCatalog({ language: opts.lang ?? cfg.language, includeZones: cfg.include_zones, includeBooks: cfg.include_books });
+  if (opts.only?.length) {
+    const unknown = opts.only.filter((id) => !items.some((i) => i.id === id));
+    if (unknown.length) {
+      throw new UsageError(`unknown item(s): ${unknown.join(', ')}. Known: ${items.map((i) => i.id).join(', ')}`);
+    }
+  }
+  return items;
+}
+
+/**
+ * Zips are deleted after each install unless keep_downloads is set, so the cache
+ * only needs room for the largest one; AddOns needs room for everything unpacked.
+ * @param {Plan[]} plans @param {string} addons @param {string} cacheDir @param {boolean} keepDownloads
+ */
+function checkSpace(plans, addons, cacheDir, keepDownloads) {
+  const need = new Map(); // device -> { bytes, where }
+  /** @param {string} p @param {number} n */
+  const add = (p, n) => {
+    const dev = deviceOf(p);
+    const cur = need.get(dev) ?? { bytes: 0, where: p };
+    cur.bytes += n;
+    need.set(dev, cur);
+  };
+  let cache = 0;
+  for (const p of plans.filter((x) => x.act && x.release)) {
+    const rel = /** @type {import('./sources/source.js').Release} */ (p.release);
+    const left = remainingBytes(cachePath(cacheDir, p.item, rel), rel.asset.size);
+    cache = keepDownloads ? cache + left : Math.max(cache, left);
+    add(addons, rel.asset.size * UNPACK_FACTOR);
+  }
+  add(cacheDir, cache);
+  for (const { bytes, where } of need.values()) {
+    const free = freeBytes(where);
+    if (bytes + MARGIN > free) {
+      throw new Error(`not enough disk space on the drive holding ${where}: need ${log.bytes(bytes + MARGIN)}, ${log.bytes(free)} free`);
+    }
+  }
+}
+
+/**
+ * Download, unpack and swap one item. Returns bytes downloaded.
+ * @param {Plan} plan @param {string} addons @param {Deps} deps @param {import('./config.js').Config} cfg
+ * @param {import('./config.js').State} state
+ */
+async function installItem(plan, addons, deps, cfg, state) {
+  const rel = /** @type {import('./sources/source.js').Release} */ (plan.release);
+  const tag = `[${plan.item.id}]`;
+  const zip = cachePath(deps.cacheDir, plan.item, rel);
+  const left = remainingBytes(zip, rel.asset.size);
+  log.info(`${tag} ${plan.reason}: ${left ? `downloading ${log.bytes(left)}` : 'using cached download'} (${rel.asset.name})`);
+  const bar = createProgress(plan.item.id, rel.asset.size, { tty: deps.tty });
+  const got = await download(rel.asset, zip, {
+    fetchImpl: deps.fetchImpl,
+    onProgress: left ? (n) => bar.update(n) : undefined,
+    onRetry: (e, n) => log.warn(`${tag} download problem (${/** @type {Error} */ (e).message}), retry ${n}`),
+  });
+  if (left && !got.cached) bar.finish(rel.asset.size);
+  log.debug(`${tag} verified ${rel.asset.sha256 ? 'sha256 ' + rel.asset.sha256.slice(0, 12) : 'size only (no digest published)'}`);
+
+  const workDir = workDirFor(addons);
+  const unpacked = await uncompressedSize(zip);
+  if (unpacked + MARGIN > freeBytes(addons)) throw new Error(`not enough disk space to unpack ${log.bytes(unpacked)} into ${addons}`);
+  const staging = path.join(workDir, `staging-${process.pid}-${Date.now()}`);
+  fs.mkdirSync(staging, { recursive: true });
+  try {
+    log.info(`${tag} unpacking ${log.bytes(unpacked)}`);
+    await extractZip(zip, staging);
+    const roots = findAddonRoots(staging);
+    const keep = roots.filter((r) => {
+      const ok = isSpokenFolder(r.name);
+      if (!ok) log.debug(`${tag} not installing ${r.name} (not a Spoken folder)`);
+      return ok;
+    });
+    if (!keep.length) throw new Error('the zip contains no Spoken addon folders');
+    for (const r of keep) {
+      if (!folderSupports(r.dir, FOREVER_INTERFACE)) {
+        log.warn(`${tag} ${r.name}: no .toc lists Interface ${FOREVER_INTERFACE}; the Forever client may mark it incompatible`);
+      }
+    }
+    /** @type {Record<string, import('./config.js').FolderState>} */
+    const folders = {};
+    for (const r of keep) folders[r.name] = { ...treeStats(r.dir), tocVersion: readFolderToc(r.dir)?.version ?? null };
+
+    swapIn({ addons, roots: keep, workDir });
+
+    const tocVersion = Object.values(folders).find((f) => f.tocVersion === rel.version)?.tocVersion;
+    if (!tocVersion) log.warn(`${tag} no .toc reports version ${rel.version}; tracking by release tag ${rel.tag}`);
+    const key = stateKey(addons);
+    state.installs[key] ??= {};
+    state.installs[key][plan.item.id] = {
+      tag: rel.tag, version: rel.version, asset: rel.asset.name, sha256: rel.asset.sha256,
+      installedAt: new Date().toISOString(), folders,
+    };
+    saveState(deps.configDir, state);
+    log.info(`${tag} installed ${rel.version}: ${keep.map((r) => r.name).join(', ')}`);
+  } finally {
+    fs.rmSync(staging, { recursive: true, force: true });
+    try {
+      fs.rmdirSync(workDir); // only succeeds when empty
+    } catch { /* still has other content */ }
+  }
+  if (!cfg.keep_downloads) {
+    fs.rmSync(path.dirname(zip), { recursive: true, force: true });
+    // Drop the now-empty <version> and <prefix> dirs too.
+    for (let d = path.dirname(path.dirname(zip)), i = 0; i < 2; i++, d = path.dirname(d)) {
+      try {
+        fs.rmdirSync(d);
+      } catch {
+        break;
+      }
+    }
+  }
+  return got.downloaded;
+}
+
+/**
+ * Build the plan for every item.
+ * @param {Options} opts @param {Deps} deps
+ */
+export async function makePlan(opts, deps) {
+  const cfg = loadConfig(deps.configDir);
+  const items = catalogFor(opts, cfg);
+  const addons = await resolveAddons(opts, deps, cfg);
+  const state = loadState(deps.configDir);
+  const mine = state.installs[stateKey(addons)] ?? {};
+  /** @type {Plan[]} */
+  const plans = [];
+  for (const item of items) {
+    /** @type {Plan} */
+    let p;
+    try {
+      const rel = await deps.source.latest(item);
+      p = inspect(item, rel, addons, mine[item.id]);
+      if (opts.only?.length) p.act = opts.only.includes(item.id) && !!rel;
+    } catch (e) {
+      // One broken release (e.g. an unexpected asset layout) must not stop the others.
+      p = { item, release: null, status: 'error', installed: null, reason: /** @type {Error} */ (e).message, folders: [], diskBytes: 0, act: false };
+    }
+    plans.push(p);
+  }
+  return { cfg, addons, state, plans };
+}
+
+/** @param {Plan} p */
+const describe = (p) => {
+  switch (p.status) {
+    case 'current': return 'up to date';
+    case 'unavailable': return `skipped: ${p.reason}`;
+    default: return p.reason;
+  }
+};
+
+/**
+ * `update` (the default) and `install --only`.
+ * Planning is read-only; nothing is written unless something needs doing.
+ * @param {Options} opts @param {Deps} deps @returns {Promise<number>} exit code
+ */
+export async function update(opts, deps) {
+  let { cfg, addons, state, plans } = await makePlan(opts, deps);
+  const workDir = workDirFor(addons);
+  const pending = pendingJournal(workDir);
+  log.info(`AddOns folder: ${addons}`);
+  if (!fs.existsSync(addons)) log.info('  (does not exist yet; it will be created)');
+
+  const report = () => {
+    for (const p of plans) {
+      const id = `[${p.item.id}]`;
+      if (p.status === 'error') log.error(`${id} ${p.reason}`);
+      else if (p.status === 'unavailable' && p.item.optional) log.info(`${id} ${describe(p)}`);
+      else if (p.status === 'unavailable') log.warn(`${id} ${describe(p)}`);
+      else if (!p.act && p.status === 'current') log.info(`${id} ${p.installed ?? ''} ${p.reason || 'up to date'}`);
+      else if (!p.act) log.info(`${id} not selected (${p.reason})`);
+    }
+  };
+  const errored = () => plans.filter((p) => p.status === 'error' || (p.status === 'unavailable' && !p.item.optional));
+  let todo = plans.filter((p) => p.act);
+
+  if (opts.dryRun) {
+    report();
+    if (pending) log.warn('an interrupted install will be recovered on the next real run');
+    if (!todo.length) {
+      log.info('\nEverything is up to date (dry run).');
+      return errored().length ? 1 : 0;
+    }
+    const total = todo.reduce((n, p) => n + remainingBytes(cachePath(deps.cacheDir, p.item, /** @type {any} */ (p.release)), p.release?.asset.size ?? 0), 0);
+    log.info('\nWould install:');
+    for (const p of todo) log.info(`  ${p.item.id.padEnd(22)} ${p.reason.padEnd(28)} ${log.bytes(p.release?.asset.size ?? 0)}`);
+    log.info(`Total to download: ${log.bytes(total)} (dry run, nothing changed)`);
+    return 0;
+  }
+
+  if (!todo.length && !pending) {
+    report();
+    const n = plans.filter((p) => p.status === 'current').length;
+    log.info(`\nEverything is up to date (${n} items). 0 bytes downloaded, 0 files changed.`);
+    return errored().length ? 1 : 0;
+  }
+
+  const running = (deps.runningWow ?? runningWow)();
+  if (running.length && !opts.force) {
+    throw new UsageError(`World of Warcraft is running (${running.join(', ')}). Close the game first, or pass --force.`);
+  }
+  if (running.length) log.warn(`WoW is running (${running.join(', ')}); continuing because of --force. /reload or restart the game afterwards.`);
+
+  let release;
+  try {
+    release = acquireLock(deps.configDir);
+  } catch (e) {
+    if (/** @type {any} */ (e).usage) throw new UsageError(/** @type {Error} */ (e).message);
+    throw e;
+  }
+  try {
+    if (pending) {
+      log.warn(String(recover(workDir)));
+      ({ cfg, addons, state, plans } = await makePlan({ ...opts, addons }, deps));
+      todo = plans.filter((p) => p.act);
+    }
+    for (const d of removeLeftovers(workDir)) log.debug(`removed leftover ${d}`);
+    report();
+    if (!todo.length) {
+      log.info('\nEverything is up to date.');
+      return errored().length ? 1 : 0;
+    }
+    checkSpace(todo, addons, deps.cacheDir, cfg.keep_downloads);
+
+    let downloaded = 0;
+    /** @type {string[]} */
+    const updated = [];
+    /** @type {string[]} */
+    const failed = errored().map((p) => p.item.id);
+    for (const p of todo) {
+      try {
+        downloaded += await installItem(p, addons, deps, cfg, state);
+        updated.push(p.item.id);
+      } catch (e) {
+        failed.push(p.item.id);
+        log.error(`[${p.item.id}] ${/** @type {Error} */ (e).message}`);
+      }
+    }
+    const current = plans.filter((p) => !p.act && p.status === 'current').length;
+    const skipped = plans.length - todo.length - current - errored().length;
+    log.info(`\nUpdated: ${updated.length}  Up to date: ${current}${skipped ? `  Skipped: ${skipped}` : ''}  Failed: ${failed.length}  Downloaded: ${log.bytes(downloaded)}`);
+    if (updated.length) log.info(`  updated: ${updated.join(', ')}`);
+    if (failed.length) log.info(`  failed:  ${failed.join(', ')} (run again to retry; finished downloads are reused)`);
+    return failed.length ? 1 : 0;
+  } finally {
+    release();
+  }
+}
+
+/** @param {Options} opts @param {Deps} deps */
+export async function status(opts, deps) {
+  const { addons, plans } = await makePlan(opts, deps);
+  log.info(`AddOns folder: ${addons}\n`);
+  const rows = [['ITEM', 'INSTALLED', 'LATEST', 'STATUS', 'ON DISK', 'DOWNLOAD', 'SOURCE']];
+  for (const p of plans) {
+    rows.push([
+      p.item.id,
+      p.installed ?? '-',
+      p.release?.version ?? '-',
+      p.status === 'current' ? (p.reason ? 'newer' : 'current') : p.status === 'unavailable' ? 'n/a' : p.status,
+      p.diskBytes ? log.bytes(p.diskBytes) : '-',
+      p.release ? log.bytes(p.release.asset.size) : '-',
+      p.release?.source ?? '-',
+    ]);
+  }
+  const w = rows[0].map((_, c) => Math.max(...rows.map((r) => r[c].length)));
+  for (const r of rows) log.info(r.map((cell, c) => cell.padEnd(w[c])).join('  ').trimEnd());
+  const pending = plans.filter((p) => p.act);
+  log.info(pending.length ? `\n${pending.length} item(s) need installing or updating. Run without arguments to update.` : '\nEverything is up to date.');
+  return 0;
+}
+
+/** @param {Options} opts @param {Deps} deps */
+export function detectCmd(opts, deps) {
+  const cfg = loadConfig(deps.configDir);
+  const found = detect({ clientFolder: cfg.client_folder }, deps.env);
+  if (cfg.addons_path) log.info(`Configured: ${cfg.addons_path}\n`);
+  if (!found.length) {
+    log.info(`No AddOns folders found for client folder "${cfg.client_folder}".`);
+    return 2;
+  }
+  for (const c of found) {
+    log.info(`${c.addons}${c.exists ? '' : '  (AddOns not created yet)'}`);
+    log.info(`    ${c.label}${c.version ? `, game ${c.version}` : ''}${c.forever ? '  [Forever]' : ''}`);
+  }
+  return 0;
+}
+
+/**
+ * Remove partial downloads, cached zips that aren't the latest release, and
+ * leftover staging dirs.
+ * @param {Options} opts @param {Deps} deps
+ */
+export async function clean(opts, deps) {
+  const cfg = loadConfig(deps.configDir);
+  // Don't pull partial downloads or staging dirs out from under a running update.
+  let release;
+  try {
+    release = acquireLock(deps.configDir);
+  } catch (e) {
+    if (/** @type {any} */ (e).usage) throw new UsageError(/** @type {Error} */ (e).message);
+    throw e;
+  }
+  try {
+    return await cleanLocked(opts, deps, cfg);
+  } finally {
+    release();
+  }
+}
+
+/** @param {Options} opts @param {Deps} deps @param {import('./config.js').Config} cfg */
+async function cleanLocked(opts, deps, cfg) {
+  let freed = 0;
+  /** @param {string} p */
+  const rm = (p) => {
+    const s = fs.statSync(p);
+    freed += s.isDirectory() ? treeStats(p).bytes : s.size;
+    fs.rmSync(p, { recursive: true, force: true });
+    log.debug(`removed ${p}`);
+  };
+
+  /** @type {Set<string>} */
+  const keep = new Set();
+  try {
+    for (const item of catalogFor(opts, cfg)) {
+      const rel = await deps.source.latest(item);
+      if (rel) keep.add(path.dirname(cachePath(deps.cacheDir, item, rel)));
+    }
+  } catch (e) {
+    log.warn(`could not reach the release source (${/** @type {Error} */ (e).message}); removing everything cached`);
+  }
+  const root = path.join(deps.cacheDir, 'downloads');
+  // downloads/<prefix>/<version>/<digest>/<asset>
+  for (const prefix of fs.existsSync(root) ? fs.readdirSync(root) : []) {
+    for (const ver of fs.readdirSync(path.join(root, prefix))) {
+      for (const id of fs.readdirSync(path.join(root, prefix, ver))) {
+        const dir = path.join(root, prefix, ver, id);
+        if (!keep.has(dir)) rm(dir);
+        else for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.part'))) rm(path.join(dir, f));
+      }
+      if (!fs.readdirSync(path.join(root, prefix, ver)).length) fs.rmdirSync(path.join(root, prefix, ver));
+    }
+    if (!fs.readdirSync(path.join(root, prefix)).length) fs.rmdirSync(path.join(root, prefix));
+  }
+
+  let addons = opts.addons || cfg.addons_path;
+  if (!addons) addons = detect({ clientFolder: cfg.client_folder }, deps.env).find((c) => c.forever)?.addons ?? '';
+  if (addons) {
+    const work = workDirFor(addons);
+    if (fs.existsSync(path.join(work, 'journal.json'))) {
+      log.warn('an interrupted install is pending; run update first so it can be recovered');
+    } else if (fs.existsSync(work)) {
+      for (const d of fs.readdirSync(work).filter((d) => /^(staging|bak)-/.test(d))) rm(path.join(work, d));
+      try {
+        fs.rmdirSync(work);
+      } catch { /* not empty */ }
+    }
+  }
+  log.info(`Freed ${log.bytes(freed)}.`);
+  return 0;
+}
+

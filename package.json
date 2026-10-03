@@ -1,0 +1,26 @@
+{
+  "name": "spoken-updater",
+  "version": "0.1.0",
+  "description": "Install and update the Spoken voiceover addons and voice packs for WoW: Forever",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "spoken-updater": "src/cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "test": "node --test \"test/*.test.js\"",
+    "build": "node scripts/build.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "yauzl": "^3.4.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6"
+  }
+}
