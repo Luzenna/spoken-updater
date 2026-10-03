@@ -40,6 +40,7 @@ await esbuild.build({
   target: 'node22',
   outfile: path.join(build, 'bundle.cjs'),
   banner: { js: `// spoken-updater ${pkg.version}` },
+  define: { 'globalThis.__SPOKEN_VERSION__': JSON.stringify(pkg.version) },
   logLevel: 'warning',
 });
 

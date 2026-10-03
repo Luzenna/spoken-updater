@@ -9,7 +9,8 @@ import { GitHubSource } from './sources/github.js';
 import { isLanguageCode } from './catalog.js';
 import { update, status, detectCmd, clean, UsageError } from './app.js';
 
-const VERSION = '0.1.0';
+// Stamped in by scripts/build.mjs from package.json (CI sets it to the release version).
+const VERSION = /** @type {any} */ (globalThis).__SPOKEN_VERSION__ ?? 'dev';
 
 const HELP = `spoken-updater ${VERSION} - Spoken voiceover addons and voice packs for WoW: Forever
 

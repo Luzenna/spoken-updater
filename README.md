@@ -119,3 +119,22 @@ make               # same, via make
 ```
 
 The build bundles `src/` with esbuild into a Node [single executable application](https://nodejs.org/api/single-executable-applications.html). It downloads the official Node binaries for each platform, checks them against nodejs.org's SHASUMS256, and injects the bundle. Both targets build from Windows or Linux. Each binary is about 85–120 MB because it contains Node.
+
+## Releases
+
+Every push to `main` that touches `src/`, `scripts/` or `package*.json` is released by
+`.github/workflows/release.yml`. It runs the tests on Ubuntu and Windows, builds both
+executables, smoke-tests each on its own OS, and publishes a GitHub release with
+`SHA256SUMS.txt`.
+
+The version comes from the latest `vX.Y.Z` tag, bumped by the subject lines of the pushed commits:
+
+| In a commit subject | Effect |
+|---|---|
+| (nothing) | patch: 0.1.0 -> 0.1.1 |
+| `#minor` or `[minor]` | minor: 0.1.1 -> 0.2.0 |
+| `#major` or `[major]` | major: 0.2.0 -> 1.0.0 |
+| `#norelease` | skip releasing this push |
+| `#release` | release even if only docs/CI changed |
+
+The first release uses the version in `package.json`. You can also start a release by hand from the Actions tab.
