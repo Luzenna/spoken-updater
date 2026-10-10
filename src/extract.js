@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import yauzl from 'yauzl';
-import { tocOwner } from './toc.js';
+import { tocOwner, readFolderToc } from './toc.js';
 
 /**
  * @typedef {{ name: string, size: number, isDir: boolean, raw: import('yauzl').Entry }} ZipEntry
@@ -168,4 +168,25 @@ export function findAddonRoots(staging) {
  */
 export function isSpokenFolder(name) {
   return /^spoken/i.test(name);
+}
+
+/**
+ * Upstream's placeholders ("tombstones") for retired folder names: nothing but
+ * .toc files, titled "... (now Spoken)" or marked X-Spoken-Tombstone. They never
+ * load and are "safe to delete", so we don't install them. SpokenContributions
+ * is also .toc-only but holds the player's contribution data, and isn't one.
+ * @param {string} dir
+ */
+export function isPlaceholder(dir) {
+  const files = [];
+  const walk = (/** @type {string} */ d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      if (e.isDirectory()) walk(path.join(d, e.name));
+      else files.push(e.name);
+    }
+  };
+  walk(dir);
+  if (!files.length || !files.every((n) => n.toLowerCase().endsWith('.toc'))) return false;
+  const t = readFolderToc(dir);
+  return !!t && (/\(now [^)]+\)/i.test(t.fields['title'] ?? '') || t.fields['x-spoken-tombstone'] === '1');
 }

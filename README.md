@@ -19,12 +19,12 @@ spoken-updater --lang frFR         also install the French voice packs
 From source (needs Node 22+): `npm install`, then `npm start`. With no arguments, it installs or updates English.
 
 **Installed by default:**
-- the addons SpokenPlayer, SpokenQuests, SpokenZones and SpokenBooks
+- the Spoken addon: the player plus its Quests, Zones and Books modules (folders `Spoken`, `Spoken_Quests`, `Spoken_Zones`, `Spoken_Books`, `SpokenContributions`)
 - the voice packs Spoken Quests Audio (the "All" bundle), Spoken Zones Audio and Spoken Books Audio
 
 That's about 2.3 GB on first install.
 
-**Item ids:** `player`, `quests`, `zones`, `books`, `quests-audio`, `zones-audio`, `books-audio`. With a language set you also get `quests-audio-<lang>`, `zones-audio-<lang>` and `books-audio-<lang>`.
+**Item ids:** `spoken`, `quests-audio`, `zones-audio`, `books-audio`. With a language set you also get `quests-audio-<lang>`, `zones-audio-<lang>` and `books-audio-<lang>`.
 
 **Flags:**
 - `--addons <path>`: use this AddOns folder.
@@ -81,10 +81,7 @@ Everything comes from [GitHub Releases](https://github.com/rusty-key/spoken-wow/
 
 | Item | Tag prefix |
 |---|---|
-| `player` | `spoken/` |
-| `quests` | `quests/` |
-| `zones` | `zones/` |
-| `books` | `books/` |
+| `spoken` | `spoken/` (one zip: `Spoken-<version>.zip`) |
 | `quests-audio` | `quests-audio/` |
 | `zones-audio` | `zones-audio/` |
 | `books-audio` | `books-audio/` |
@@ -98,6 +95,14 @@ Everything comes from [GitHub Releases](https://github.com/rusty-key/spoken-wow/
 **Not offered:**
 - The old faction-split quest packs stopped at v2.0.0 and don't support Forever.
 - There is no 64 kbps zones pack.
+
+**Spoken 3.x.** Since 3.0.0 the player and the Quests, Zones and Books modules ship as one
+addon. The old 2.x folders (`SpokenPlayer`, `SpokenQuests`, `SpokenZones`, `SpokenBooks`) are
+retired, and the `quests/`, `zones/` and `books/` tags are no longer used. Installing 3.x
+removes those old folders in the same transaction; otherwise both generations would load and
+every line would be voiced twice. Upstream's empty placeholder folders (e.g. the new
+`SpokenPlayer`, "now Spoken") are never installed. `include_zones` / `include_books` switch
+the `Spoken_Zones` / `Spoken_Books` module folders and their voice packs.
 
 Sources plug in through `src/sources/source.js`. A Wago source is possible, but Wago's API needs a personal API key.
 

@@ -36,6 +36,7 @@ export const DEFAULT_CONFIG = {
  * @property {string} version     release version installed
  * @property {string} asset
  * @property {string | null} sha256
+ * @property {string[]} [exclude]  folders left out at install (zones/books switched off)
  * @property {string} installedAt
  * @property {Record<string, FolderState>} folders
  * @typedef {{ schema: 1, installs: Record<string, Record<string, ItemState>> }} State

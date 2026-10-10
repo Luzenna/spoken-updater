@@ -90,7 +90,9 @@ function rollback(j, rename) {
 /**
  * Swap `roots` (folders in staging) into `addons`. Existing folders with the same
  * name, matched case-insensitively, are replaced. Nothing else in AddOns is touched.
- * @param {{ addons: string, roots: { name: string, dir: string }[], workDir?: string, rename?: RenameFn }} opts
+ * `remove` names folders to take out in the same transaction (retired folders
+ * the new release replaces); they go to the backup too, so a failure restores them.
+ * @param {{ addons: string, roots: { name: string, dir: string }[], remove?: string[], workDir?: string, rename?: RenameFn }} opts
  */
 export function swapIn(opts) {
   const rename = opts.rename ?? renameRetry;
@@ -103,6 +105,16 @@ export function swapIn(opts) {
   const j = { bakDir, moves: [], committed: false };
   writeJournal(workDir, j);
   try {
+    const installing = new Set(opts.roots.map((r) => r.name.toLowerCase()));
+    for (const name of opts.remove ?? []) {
+      if (installing.has(name.toLowerCase())) continue;
+      const existing = findChild(opts.addons, name, { dirsOnly: true });
+      if (!existing) continue;
+      const m = /** @type {Move} */ ({ kind: 'backup', from: path.join(opts.addons, existing), to: path.join(bakDir, existing) });
+      j.moves.push(m);
+      writeJournal(workDir, j);
+      rename(m.from, m.to);
+    }
     for (const r of opts.roots) {
       const existing = findChild(opts.addons, r.name, { dirsOnly: true });
       if (existing) {

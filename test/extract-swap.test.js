@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeZip, tmpDir, toc, writeTree, snapshot } from './helpers.js';
-import { extractZip, findAddonRoots, isSpokenFolder, normaliseEntryName } from '../src/extract.js';
+import { extractZip, findAddonRoots, isSpokenFolder, isPlaceholder, normaliseEntryName } from '../src/extract.js';
 import { swapIn, recover } from '../src/swap.js';
 
 /** Extract a zip built from `files` and return the addon roots found. @param {Record<string, string>} files */
@@ -170,4 +170,37 @@ test('rollback never deletes an install target the swap did not create', () => {
   assert.throws(() => swapIn({ addons: f.addons, roots: f.roots, workDir: f.work, rename }), /target exists/);
   assert.equal(fs.readFileSync(path.join(f.addons, 'SpokenContributions'), 'utf8'), 'not a folder');
   assert.ok(fs.existsSync(path.join(f.addons, 'SpokenPlayer', 'old.lua')), 'original restored');
+});
+
+test('placeholders are recognised; SpokenContributions (toc-only data holder) is not one', async () => {
+  const { roots } = await rootsOf({
+    'SpokenPlayer/SpokenPlayer.toc': '## Interface: 100007, 16001\n## Title: |cff888888Spoken Player (now Spoken)|r\n## LoadOnDemand: 1\n',
+    'ZoneLore/ZoneLore.toc': '## Title: ZoneLore\n## X-Spoken-Tombstone: 1\n',
+    'SpokenContributions/SpokenContributions.toc': '## Title: |cff888888Spoken Contributions|r\n## SavedVariables: SpokenContributionsDB\n',
+    // Has code, so never a placeholder whatever its title says.
+    'Spoken/Spoken.toc': '## Title: Spoken (now with more lore)\n', 'Spoken/Core.lua': 'code',
+  });
+  const by = Object.fromEntries(roots.map((r) => [r.name, isPlaceholder(r.dir)]));
+  assert.deepEqual(by, { SpokenPlayer: true, ZoneLore: true, SpokenContributions: false, Spoken: false });
+});
+
+test('swap can remove retired folders in the same transaction, and restores them on failure', () => {
+  const f = addonsFixture();
+  writeTree(f.addons, { 'SpokenQuests/SpokenQuests.toc': toc('2.2.1'), 'SpokenQuests/Core.lua': 'old' });
+  const before = snapshot(f.addons);
+  let n = 0;
+  const failing = (/** @type {string} */ a, /** @type {string} */ b) => {
+    if (++n === 4) throw new Error('boom');
+    fs.renameSync(a, b);
+  };
+  assert.throws(() => swapIn({ addons: f.addons, roots: f.roots, remove: ['SpokenQuests'], workDir: f.work, rename: failing }), /boom/);
+  assert.deepEqual(snapshot(f.addons), before, 'removed folder restored too');
+
+  // A failed swap consumes its staging copy, so start over for the success case.
+  const g = addonsFixture();
+  writeTree(g.addons, { 'SpokenQuests/SpokenQuests.toc': toc('2.2.1') });
+  swapIn({ addons: g.addons, roots: g.roots, remove: ['SpokenQuests', 'SpokenPlayer'], workDir: g.work });
+  assert.ok(!fs.existsSync(path.join(g.addons, 'SpokenQuests')));
+  assert.ok(fs.existsSync(path.join(g.addons, 'SpokenPlayer', 'new.lua')), 'a folder being installed is never removed');
+  assert.ok(fs.existsSync(path.join(g.addons, 'Details')));
 });

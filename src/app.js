@@ -13,7 +13,7 @@ import { detect } from './detect/detect.js';
 import { findChild } from './detect/fold.js';
 import { tocFiles, readFolderToc, folderSupports, FOREVER_INTERFACE } from './toc.js';
 import { cachePath, download, remainingBytes } from './download.js';
-import { extractZip, findAddonRoots, isSpokenFolder, uncompressedSize } from './extract.js';
+import { extractZip, findAddonRoots, isSpokenFolder, isPlaceholder, uncompressedSize } from './extract.js';
 import { swapIn, recover, workDirFor, pendingJournal, removeLeftovers } from './swap.js';
 import { acquireLock } from './lock.js';
 import { createProgress } from './progress.js';
@@ -140,7 +140,13 @@ export function inspect(item, rel, addons, st) {
   const installed = versions.length ? versions.reduce((a, b) => (semver.compare(a, b) <= 0 ? a : b)) : st?.version ?? null;
   plan.installed = installed;
 
-  if (installed && semver.compare(installed, rel.version) === 0) return plan;
+  const leftovers = (item.replaces?.folders ?? []).filter((n) => findChild(addons, n, { dirsOnly: true }));
+  const exclusionChanged = !!st && [...(st.exclude ?? [])].sort().join() !== [...(item.exclude ?? [])].sort().join();
+  if (installed && semver.compare(installed, rel.version) === 0) {
+    if (leftovers.length) return { ...plan, status: 'outdated', reason: `old folders to remove: ${leftovers.join(', ')}`, act: true };
+    if (exclusionChanged) return { ...plan, status: 'outdated', reason: 'zones/books setting changed', act: true };
+    return plan;
+  }
   // Never downgrade: a newer build (from Wago, or a dev copy) is left alone.
   if (installed && semver.compare(installed, rel.version) > 0) return { ...plan, reason: `newer than the latest release (${rel.version})` };
   // Upstream sometimes ships a .toc whose Version differs from the tag. If the
@@ -271,10 +277,14 @@ async function installItem(plan, addons, deps, cfg, state) {
     log.info(`${tag} unpacking ${log.bytes(unpacked)}`);
     await extractZip(zip, staging);
     const roots = findAddonRoots(staging);
+    const excluded = new Set(plan.item.exclude ?? []);
     const keep = roots.filter((r) => {
-      const ok = isSpokenFolder(r.name);
-      if (!ok) log.debug(`${tag} not installing ${r.name} (not a Spoken folder)`);
-      return ok;
+      let why = null;
+      if (!isSpokenFolder(r.name)) why = 'not a Spoken folder';
+      else if (isPlaceholder(r.dir)) why = 'an empty placeholder for a retired folder';
+      else if (excluded.has(r.name.toLowerCase())) why = 'switched off in the config';
+      if (why) log.debug(`${tag} not installing ${r.name} (${why})`);
+      return !why;
     });
     if (!keep.length) throw new Error('the zip contains no Spoken addon folders');
     for (const r of keep) {
@@ -286,14 +296,27 @@ async function installItem(plan, addons, deps, cfg, state) {
     const folders = {};
     for (const r of keep) folders[r.name] = { ...treeStats(r.dir), tocVersion: readFolderToc(r.dir)?.version ?? null };
 
-    swapIn({ addons, roots: keep, workDir });
+    // Remove, in the same transaction: folders this item installed before that the
+    // new release no longer has (or that are now switched off), and the folders of
+    // the retired addons this item replaces. Only Spoken-named folders, ever.
+    const key = stateKey(addons);
+    const mine = state.installs[key] ?? {};
+    const keepNames = new Set(keep.map((r) => r.name.toLowerCase()));
+    const remove = [...new Set([
+      ...Object.keys(mine[plan.item.id]?.folders ?? {}),
+      ...(plan.item.replaces?.items ?? []).flatMap((id) => Object.keys(mine[id]?.folders ?? {})),
+      ...(plan.item.replaces?.folders ?? []),
+    ])].filter((n) => isSpokenFolder(n) && !keepNames.has(n.toLowerCase()) && findChild(addons, n, { dirsOnly: true }));
+    for (const n of remove) log.info(`${tag} removing old folder ${n}`);
+
+    swapIn({ addons, roots: keep, remove, workDir });
+    for (const id of plan.item.replaces?.items ?? []) delete mine[id];
 
     const tocVersion = Object.values(folders).find((f) => f.tocVersion === rel.version)?.tocVersion;
     if (!tocVersion) log.warn(`${tag} no .toc reports version ${rel.version}; tracking by release tag ${rel.tag}`);
-    const key = stateKey(addons);
-    state.installs[key] ??= {};
+    state.installs[key] = mine;
     state.installs[key][plan.item.id] = {
-      tag: rel.tag, version: rel.version, asset: rel.asset.name, sha256: rel.asset.sha256,
+      tag: rel.tag, version: rel.version, asset: rel.asset.name, sha256: rel.asset.sha256, exclude: plan.item.exclude ?? [],
       installedAt: new Date().toISOString(), folders,
     };
     saveState(deps.configDir, state);

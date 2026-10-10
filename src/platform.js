@@ -27,8 +27,10 @@ export function deviceOf(p) {
 }
 
 // WoW client executables: Wow.exe, WowB.exe, WowClassic.exe, WowClassicB.exe ...
-// The Battle.net launcher ("World of Warcraft Launcher.exe") deliberately doesn't match.
-export const WOW_EXE = /^wow\w*\.exe$/i;
+// The Battle.net launcher ("World of Warcraft Launcher.exe") deliberately doesn't
+// match, and neither does the voice-chat helper (WowVoiceProxy.exe, WowVoiceProxyT.exe),
+// which can outlive the game.
+export const WOW_EXE = /^wow(?!voiceproxy)\w*\.exe$/i;
 
 /** @param {string} arg */
 const baseName = (arg) => arg.split(/[\\/]/).pop() ?? '';

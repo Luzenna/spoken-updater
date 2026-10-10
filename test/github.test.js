@@ -34,7 +34,13 @@ test('tag filtering is exact on the prefix and ignores drafts, prereleases and j
 test('Forever build selection skips legacy private-server zips', () => {
   assert.equal(pickAsset(RELEASES[5].assets).name, 'SpokenQuests-2.2.1.zip');
   assert.throws(() => pickAsset([]), /no Forever-compatible zip/);
-  assert.throws(() => pickAsset(rel('x/v1.0.0', ['A-1.0.0.zip', 'B-1.0.0.zip']).assets), /ambiguous/);
+  // spoken/v3.0.0 shipped the real zip plus tiny placeholder zips for the retired addons.
+  const v300 = rel('spoken/v3.0.0', ['SpokenBooks-3.0.0.zip', 'Spoken-3.0.0.zip', 'SpokenQuests-3.0.0.zip']).assets;
+  v300[1].size = 1;
+  assert.equal(pickAsset(v300, 'spoken', '3.0.0').name, 'Spoken-3.0.0.zip', 'named after the prefix wins');
+  const unnamed = rel('x/v1.0.0', ['A-1.0.0.zip', 'B-1.0.0.zip']).assets;
+  unnamed[0].size = 9e6;
+  assert.equal(pickAsset(unnamed, 'x', '1.0.0').name, 'A-1.0.0.zip', 'otherwise the largest');
   assert.equal(pickAsset(rel('x/v1.0.0', ['notes.txt', 'A-1.0.0.zip']).assets).name, 'A-1.0.0.zip');
 });
 
@@ -66,8 +72,21 @@ test('releases are paginated via the Link header and fetched once', async () => 
 test('catalog: English defaults, languages and toggles', () => {
   const ids = (/** @type {any} */ o) => buildCatalog(o).map((i) => i.id);
   assert.deepEqual(ids({ language: 'enUS', includeZones: true, includeBooks: true }),
-    ['player', 'quests', 'zones', 'books', 'quests-audio', 'zones-audio', 'books-audio']);
+    ['spoken', 'quests-audio', 'zones-audio', 'books-audio']);
   assert.deepEqual(ids({ language: 'frFR', includeZones: false, includeBooks: true }),
-    ['player', 'quests', 'books', 'quests-audio', 'books-audio', 'quests-audio-frFR', 'books-audio-frFR']);
-  assert.equal(buildCatalog({ language: 'enUS', includeZones: true, includeBooks: true })[0].tagPrefix, 'spoken');
+    ['spoken', 'quests-audio', 'books-audio', 'quests-audio-frFR', 'books-audio-frFR']);
+  const [sp] = buildCatalog({ language: 'enUS', includeZones: false, includeBooks: true });
+  assert.equal(sp.tagPrefix, 'spoken');
+  assert.deepEqual(sp.exclude, ['spoken_zones']);
+  assert.deepEqual(sp.replaces?.items, ['player', 'quests', 'zones', 'books']);
+});
+
+test('a release published without assets falls back to the previous one', async () => {
+  const list = [rel('spoken/v3.0.1', []), rel('spoken/v3.0.0', ['Spoken-3.0.0.zip'])];
+  /** @type {any} */
+  const fakeFetch = async () => new Response(JSON.stringify(list), { status: 200 });
+  const src = new GitHubSource({ fetchImpl: fakeFetch });
+  const r = await src.latest({ id: 'spoken', tagPrefix: 'spoken', kind: 'addon', title: '', optional: false });
+  assert.equal(r?.version, '3.0.0');
+  assert.equal(r?.asset.name, 'Spoken-3.0.0.zip');
 });

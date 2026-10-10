@@ -37,3 +37,22 @@ test('toc owner handles flavor suffixes', () => {
   assert.equal(tocOwner('SpokenQuestsAudio_frFR.toc'), 'SpokenQuestsAudio_frFR');
   assert.equal(tocOwner('readme.md'), null);
 });
+
+test('WoW process detection matches game clients only', async () => {
+  const { WOW_EXE, linuxProcesses } = await import('../src/platform.js');
+  for (const n of ['Wow.exe', 'WowB.exe', 'WowClassic.exe', 'WowClassicB.exe', 'WOWB.EXE']) assert.ok(WOW_EXE.test(n), n);
+  for (const n of ['WowVoiceProxy.exe', 'WowVoiceProxyT.exe', 'World of Warcraft Launcher.exe', 'Battle.net.exe', 'wowup.exe.bak']) {
+    assert.ok(!WOW_EXE.test(n), n);
+  }
+  // A fake /proc: wine runs the client with its Windows path in cmdline.
+  const { tmpDir, writeTree } = await import('./helpers.js');
+  const proc = tmpDir();
+  writeTree(proc, {
+    // comm is truncated to 15 chars by the kernel, so cmdline is what identifies the client.
+    '101/cmdline': 'C:\\Program Files (x86)\\World of Warcraft\\_classic_beta_\\WowB.exe\0-launch\0', '101/comm': 'WowB.exe',
+    '102/cmdline': 'C:\\windows\\system32\\WowVoiceProxyT.exe\0', '102/comm': 'WowVoiceProxyT.',
+    '104/cmdline': 'Z:\\home\\deck\\Games\\World of Warcraft\\_classic_beta_\\WowClassicB.exe\0', '104/comm': 'WowClassicB.exe',
+    '103/cmdline': '/usr/bin/konsole\0', '103/comm': 'konsole',
+  });
+  assert.deepEqual(linuxProcesses(proc).sort(), ['WowB.exe', 'WowClassicB.exe']);
+});

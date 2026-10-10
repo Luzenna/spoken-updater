@@ -11,19 +11,26 @@ export const DEFAULT_REPO = 'rusty-key/spoken-wow';
  * @typedef {{ tag_name: string, draft: boolean, prerelease: boolean, assets: GhAsset[] }} GhRelease
  */
 
+/** Zips meant for Blizzard clients: legacy private-server builds ("<Addon>-WoW_1.12-<ver>.zip") excluded. @param {GhAsset[]} assets */
+const usableZips = (assets) =>
+  assets.filter((a) => /\.zip$/i.test(a.name) && !/-WoW_\d/i.test(a.name) && (a.state ?? 'uploaded') === 'uploaded');
+
 /**
- * Pick the one zip meant for modern clients (which includes Forever). Spoken
- * publishes a multi-flavor zip plus legacy private-server builds named
- * "<Addon>-WoW_1.12-<ver>.zip"; those must never be chosen.
- * @param {GhAsset[]} assets @returns {GhAsset}
+ * Pick the zip meant for modern clients (which includes Forever). Usually there
+ * is exactly one. When there are several (spoken/v3.0.0 shipped Spoken-3.0.0.zip
+ * plus tiny placeholder zips for the retired addons), prefer the one named after
+ * the tag prefix, e.g. "spoken" -> "Spoken-3.0.0.zip", and otherwise the largest.
+ * @param {GhAsset[]} assets @param {string} [prefix] @param {string | null} [version] @returns {GhAsset}
  */
-export function pickAsset(assets) {
-  const zips = assets.filter(
-    (a) => /\.zip$/i.test(a.name) && !/-WoW_\d/i.test(a.name) && (a.state ?? 'uploaded') === 'uploaded',
-  );
+export function pickAsset(assets, prefix, version) {
+  const zips = usableZips(assets);
   if (zips.length === 1) return zips[0];
   if (!zips.length) throw new Error(`no Forever-compatible zip among assets: ${assets.map((a) => a.name).join(', ') || '(none)'}`);
-  throw new Error(`ambiguous assets, expected one zip: ${zips.map((a) => a.name).join(', ')}`);
+  const named = prefix && version
+    ? zips.filter((a) => a.name.toLowerCase() === `${prefix}-${version}.zip`.toLowerCase() || a.name.toLowerCase() === `${prefix}-v${version}.zip`.toLowerCase())
+    : [];
+  if (named.length === 1) return named[0];
+  return [...zips].sort((x, y) => y.size - x.size)[0];
 }
 
 /**
@@ -99,13 +106,18 @@ export class GitHubSource {
 
   /** @param {import('../catalog.js').Item} item @returns {Promise<import('./source.js').Release | null>} */
   async latest(item) {
-    const [top] = filterReleases(await this.releases(), item.tagPrefix);
-    if (!top) return null;
-    const a = pickAsset(top.r.assets);
+    const releases = filterReleases(await this.releases(), item.tagPrefix);
+    if (!releases.length) return null;
+    // A release can be published without assets (spoken/v3.0.1 was); fall back
+    // to the newest one that has a usable zip.
+    const top = releases.find((x) => usableZips(x.r.assets).length);
+    if (!top) pickAsset(releases[0].r.assets, item.tagPrefix, releases[0].version); // throws a clear error
+    const t = /** @type {typeof releases[number]} */ (top);
+    const a = pickAsset(t.r.assets, item.tagPrefix, /** @type {string} */ (t.version));
     const digest = a.digest && /^sha256:([0-9a-f]{64})$/i.exec(a.digest);
     return {
-      version: /** @type {string} */ (top.version),
-      tag: top.r.tag_name,
+      version: /** @type {string} */ (t.version),
+      tag: t.r.tag_name,
       asset: { name: a.name, url: a.browser_download_url, size: a.size, sha256: digest ? digest[1].toLowerCase() : null },
       source: this.name,
     };

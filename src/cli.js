@@ -33,7 +33,7 @@ Options:
   --verbose, -v     more detail
   --version, --help
 
-Items: player, quests, zones, books, quests-audio, zones-audio, books-audio,
+Items: spoken, quests-audio, zones-audio, books-audio,
        and quests-audio-<lang>, zones-audio-<lang>, books-audio-<lang> with --lang.
 Config file: ${appDirs().config}${process.platform === 'win32' ? '\\' : '/'}config.json
 GitHub token (optional, for rate limits): SPOKEN_GITHUB_TOKEN or GITHUB_TOKEN.`;
