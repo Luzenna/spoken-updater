@@ -7,6 +7,7 @@ import * as log from './log.js';
 import { appDirs, loadConfig, githubToken } from './config.js';
 import { GitHubSource } from './sources/github.js';
 import { isLanguageCode } from './catalog.js';
+import { trySelfUpdate } from './selfupdate.js';
 import { update, status, detectCmd, clean, UsageError } from './app.js';
 
 // Stamped in by scripts/build.mjs from package.json (CI sets it to the release version).
@@ -29,6 +30,7 @@ Options:
   --dry-run         show what update would do, change nothing
   --yes, -y         never ask questions (for shortcuts and scripts)
   --force           install even while WoW is running
+  --no-self-update  don't check GitHub for a newer spoken-updater first
   --pause-on-exit   wait for Enter (max 30 s) before closing the window
   --verbose, -v     more detail
   --version, --help
@@ -50,6 +52,7 @@ export async function main(argv) {
       'dry-run': { type: 'boolean' },
       yes: { type: 'boolean', short: 'y' },
       force: { type: 'boolean' },
+      'no-self-update': { type: 'boolean' },
       'pause-on-exit': { type: 'boolean' },
       verbose: { type: 'boolean', short: 'v' },
       version: { type: 'boolean' },
@@ -83,9 +86,11 @@ export async function main(argv) {
   switch (cmd) {
     case 'update':
       if (opts.only) throw new UsageError('use "install --only <items>" to pick items');
+      if (!opts.dryRun && !values['no-self-update']) await trySelfUpdate(VERSION, dirs.cache);
       return update(opts, deps);
     case 'install':
       if (!opts.only?.length) throw new UsageError('install needs --only <item>[,<item>]');
+      if (!opts.dryRun && !values['no-self-update']) await trySelfUpdate(VERSION, dirs.cache);
       return update(opts, deps);
     case 'status':
       return status(opts, deps);

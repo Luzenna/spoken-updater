@@ -30,6 +30,7 @@ That's about 2.3 GB on first install.
 - `--addons <path>`: use this AddOns folder.
 - `--yes`: never prompt.
 - `--force`: install even while WoW is running.
+- `--no-self-update`: skip the check for a newer spoken-updater. Normally `update` and `install` first look at this tool's GitHub releases and, if a newer one exists, download it (sha256-checked, and test-run before use) and replace the executable; the new version takes effect on the next run. If anything fails it only prints a warning and carries on.
 - `--pause-on-exit`: keep the window open at the end.
 - `--verbose`: print more detail.
 
